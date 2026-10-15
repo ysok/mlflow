@@ -1,0 +1,172 @@
+name: Advisory Summary
+
+# Daily summary of new and changed repository security advisories, published as a draft item in a
+# private org project. Advisory data is confidential and workflow logs are public, so every step
+# discards its stdout/stderr; a failure only shows as a failed step.
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - sec-advisory-project-test
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+permissions: {}
+cache-mode: none
+
+env:
+  PROJECT_NUMBER: "12"
+  OUT_DIR: /tmp/advisory-summary/out
+
+jobs:
+  summarize:
+    if: github.repository == 'mlflow/mlflow'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .claude/sandbox
+            .claude/scripts
+            .claude/skills/advisory-summary
+            .github/actions/setup-gateway
+            .github/actions/setup-node
+
+      # Used only outside the sandbox: the agent never sees it.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: mlflow
+          repositories: mlflow
+          permission-repository-advisories: read
+          permission-organization-projects: write
+
+      # Inputs live under RUNNER_TEMP, which the sandbox can read but not write, so the agent
+      # can't tamper with the processed list that `publish.py` embeds.
+      - name: Fetch advisories
+        id: prepare
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          ORG: ${{ github.repository_owner }}
+          IN_DIR: ${{ runner.temp }}/advisory-summary/in
+        run: |
+          exec >/dev/null 2>&1
+          python3 .claude/skills/advisory-summary/scripts/prepare.py "$IN_DIR"
+
+      - if: steps.prepare.outputs.pending != '0'
+        uses: ./.github/actions/setup-node
+
+      - name: Install agent and sandbox
+        if: steps.prepare.outputs.pending != '0'
+        run: |
+          exec >/dev/null 2>&1
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap socat ripgrep
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)" = 1 ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          .claude/scripts/install-claude.sh
+          export npm_config_before="$(date -u -d '7 days ago' +%Y-%m-%d)"
+          npm install -g @anthropic-ai/sandbox-runtime@0.0.77
+
+      - id: gateway
+        if: steps.prepare.outputs.pending != '0'
+        uses: ./.github/actions/setup-gateway
+        with:
+          task: advisory-summary
+          host: ${{ secrets.DATABRICKS_HOST }}
+          client-id: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          client-secret: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+
+      - name: Start gateway proxy
+        if: steps.prepare.outputs.pending != '0'
+        env:
+          GATEWAY_TOKEN: ${{ steps.gateway.outputs.token }}
+          GATEWAY_URL: ${{ steps.gateway.outputs.base-url }}
+        run: |
+          exec >/dev/null 2>&1
+          umask 077
+          printf '%s\n' "$GATEWAY_TOKEN" | env -u GATEWAY_TOKEN \
+            GATEWAY_URL="$GATEWAY_URL" node .claude/sandbox/gateway-proxy.mjs &
+          proxy_pid=$!
+          unset GATEWAY_TOKEN
+          for _ in $(seq 1 30); do
+            kill -0 "$proxy_pid" || exit 1
+            curl -fsS http://127.0.0.1:8080/healthz && exit 0
+            sleep 2
+          done
+          exit 1
+
+      - name: Check sandbox restrictions
+        if: steps.prepare.outputs.pending != '0'
+        env:
+          IN_DIR: ${{ runner.temp }}/advisory-summary/in
+        run: |
+          exec >/dev/null 2>&1
+          srt --settings .claude/sandbox/srt-advisory-summary.json -- true
+          # Runner.Worker holds the credentials referenced by this job.
+          ps -e -o comm= | grep -Fxq Runner.Worker
+          # `set -e` ignores a failing `! cmd`, so check each forbidden operation explicitly.
+          for command in \
+            'ps -e -o comm= | grep -Fxq Runner.Worker' \
+            'curl -sf https://api.github.com' \
+            'curl -sf https://example.com' \
+            "touch '$IN_DIR/manifest.json'" \
+            'ls /home/runner/work/_temp/_runner_file_commands | grep -q .'; do
+            if srt --settings .claude/sandbox/srt-advisory-summary.json -- bash -c "$command"; then
+              exit 1
+            fi
+          done
+
+      - name: Summarize advisories
+        if: steps.prepare.outputs.pending != '0'
+        env:
+          ANTHROPIC_BASE_URL: http://localhost:8080/anthropic
+          ANTHROPIC_AUTH_TOKEN: placeholder
+          ANTHROPIC_CUSTOM_HEADERS: ${{ steps.gateway.outputs.custom-headers }}
+          # Used by the auto mode classifier. The gateway rejects its requests for Sonnet 5.5.
+          ANTHROPIC_DEFAULT_SONNET_MODEL: databricks-claude-sonnet-5
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          IN_DIR: ${{ runner.temp }}/advisory-summary/in
+        run: |
+          exec >/dev/null 2>&1
+          mkdir -p "$OUT_DIR" ~/.claude
+          # Claude Code rejects an empty config file.
+          echo '{}' > ~/.claude.json
+          timeout 40m srt --settings .claude/sandbox/srt-advisory-summary.json -- \
+            env -u NO_PROXY -u no_proxy claude \
+            --model databricks-claude-opus-5-5 \
+            --effort high \
+            --max-budget-usd 10 \
+            --permission-mode auto \
+            --disallowed-tools WebSearch WebFetch \
+            --print \
+            "/advisory-summary $IN_DIR $OUT_DIR"
+          test -s "$OUT_DIR/summary.md"
+
+      - name: Publish summary
+        if: steps.prepare.outputs.pending != '0'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          ORG: ${{ github.repository_owner }}
+          IN_DIR: ${{ runner.temp }}/advisory-summary/in
+        run: |
+          exec >/dev/null 2>&1
+          python3 .claude/skills/advisory-summary/scripts/publish.py "$IN_DIR" "$OUT_DIR"

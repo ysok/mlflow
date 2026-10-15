@@ -1,0 +1,20 @@
+{
+  "network": {
+    "allowedDomains": ["localhost:8080"],
+    "deniedDomains": [],
+    "allowAllUnixSockets": false
+  },
+  "filesystem": {
+    "denyRead": [
+      "~/.ssh",
+      "~/.docker",
+      "~/.config/gh",
+      "/var/run/docker.sock",
+      "/run/docker.sock",
+      "/run/containerd",
+      "/home/runner/work/_temp/_runner_file_commands"
+    ],
+    "allowWrite": ["/tmp", "~/.claude", "~/.claude.json"],
+    "denyWrite": []
+  }
+}

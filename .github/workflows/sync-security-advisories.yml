@@ -6,6 +6,9 @@ name: Sync Security Advisories
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - sec-advisory-project-test
 
 concurrency:
   group: ${{ github.workflow }}

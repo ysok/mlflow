@@ -72,3 +72,22 @@ under `$in_dir` and write files under `$out_dir`.
 - Keep it under 20,000 characters.
 
 Create `$out_dir` first. Do not modify `$in_dir`. Stop after writing `$out_dir/summary.md`.
+
+## Running locally
+
+`.github/workflows/advisory-summary.yml` runs this daily in a sandbox. To try a change to this
+skill locally, you need admin or security manager access to the repository's advisories. Keep
+`in` and `out` outside the checkout so advisory data can't be committed by accident:
+
+```bash
+D=$(mktemp -d)
+# --limit keeps the run small; --project 12 compares against the last published summary.
+GH_TOKEN=$(gh auth token) uv run --no-project \
+  .claude/skills/advisory-summary/scripts/prepare.py "$D/in" --limit 5
+claude "/advisory-summary $D/in $D/out"
+# Shows what the workflow would publish, without publishing it.
+uv run --no-project .claude/skills/advisory-summary/scripts/publish.py "$D/in" "$D/out" --dry-run
+rm -rf "$D"
+```
+
+A local run skips the CI sandbox, so the agent there has your normal permissions.

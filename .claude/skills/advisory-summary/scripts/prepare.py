@@ -10,10 +10,10 @@ Runs outside the sandbox with a GitHub App token. Prints nothing: advisory data 
 and workflow logs are public.
 """
 
+import argparse
 import json
 import os
 import re
-import sys
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -109,23 +109,47 @@ def parse_processed(body: str) -> dict[str, str]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("in_dir", type=Path)
+    parser.add_argument("--repo", default="mlflow/mlflow")
+    parser.add_argument(
+        "--project",
+        type=int,
+        help="Org project number holding past summaries. Without it, all open advisories are new.",
+    )
+    parser.add_argument(
+        "--limit", type=int, help="Cover at most this many of the newest advisories."
+    )
+    args = parser.parse_args()
+
     token = os.environ["GH_TOKEN"]
-    in_dir = Path(sys.argv[1])
-    advisories = fetch_advisories(token, os.environ["REPO"])
-    latest = fetch_latest_summary(token, os.environ["ORG"], int(os.environ["PROJECT_NUMBER"]))
+    in_dir: Path = args.in_dir
+    advisories = fetch_advisories(token, args.repo)
+    org = args.repo.split("/")[0]
+    latest = fetch_latest_summary(token, org, args.project) if args.project else None
     previous = parse_processed(latest[1]) if latest else {}
 
     (in_dir / "advisories").mkdir(parents=True, exist_ok=True)
-    new: list[str] = []
-    changed: list[dict[str, Any]] = []
+    open_advisories = []
     for advisory in advisories:
+        (in_dir / "advisories" / f"{advisory['ghsa_id']}.json").write_text(
+            json.dumps(advisory, indent=2)
+        )
+        if advisory["state"] in OPEN_STATES:
+            open_advisories.append(advisory)
+
+    pending = [a for a in open_advisories if previous.get(a["ghsa_id"]) != fingerprint(a)]
+    pending.sort(key=lambda a: a["updated_at"], reverse=True)
+    covered = {a["ghsa_id"] for a in pending[: args.limit]}
+    new = []
+    changed = []
+    for advisory in pending:
         ghsa = advisory["ghsa_id"]
-        (in_dir / "advisories" / f"{ghsa}.json").write_text(json.dumps(advisory, indent=2))
-        if advisory["state"] not in OPEN_STATES:
+        if ghsa not in covered:
             continue
         if ghsa not in previous:
             new.append(ghsa)
-        elif previous[ghsa] != fingerprint(advisory):
+        else:
             updated_at, _, comments = previous[ghsa].partition(" ")
             changed.append({
                 "ghsa_id": ghsa,
@@ -140,12 +164,18 @@ def main() -> None:
         "total": len(advisories),
     }
     (in_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    # Advisories left out by --limit keep their previous entry, so the next run still covers them.
+    processed = {a["ghsa_id"]: fingerprint(a) for a in open_advisories}
+    for advisory in pending:
+        ghsa = advisory["ghsa_id"]
+        if ghsa in covered:
+            continue
+        if ghsa in previous:
+            processed[ghsa] = previous[ghsa]
+        else:
+            del processed[ghsa]
     (in_dir / "processed.txt").write_text(
-        "".join(
-            f"{a['ghsa_id']} {fingerprint(a)}\n"
-            for a in sorted(advisories, key=lambda a: a["ghsa_id"])
-            if a["state"] in OPEN_STATES
-        )
+        "".join(f"{ghsa} {fp}\n" for ghsa, fp in sorted(processed.items()))
     )
     if output := os.environ.get("GITHUB_OUTPUT"):
         with open(output, "a") as f:

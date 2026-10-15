@@ -63,11 +63,11 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
-          ORG: ${{ github.repository_owner }}
           IN_DIR: ${{ runner.temp }}/advisory-summary/in
         run: |
           exec >/dev/null 2>&1
-          python3 .claude/skills/advisory-summary/scripts/prepare.py "$IN_DIR"
+          python3 .claude/skills/advisory-summary/scripts/prepare.py "$IN_DIR" \
+            --repo "$REPO" --project "$PROJECT_NUMBER"
 
       - if: steps.prepare.outputs.pending != '0'
         uses: ./.github/actions/setup-node
@@ -165,8 +165,8 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
-          ORG: ${{ github.repository_owner }}
           IN_DIR: ${{ runner.temp }}/advisory-summary/in
         run: |
           exec >/dev/null 2>&1
-          python3 .claude/skills/advisory-summary/scripts/publish.py "$IN_DIR" "$OUT_DIR"
+          python3 .claude/skills/advisory-summary/scripts/publish.py "$IN_DIR" "$OUT_DIR" \
+            --repo "$REPO" --project "$PROJECT_NUMBER"

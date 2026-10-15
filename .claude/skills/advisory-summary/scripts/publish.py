@@ -7,9 +7,10 @@ publishing: HTML, images, links, and bare URLs are removed (an image or link to 
 could leak advisory content when the item is viewed), @-mentions are defused so nobody is
 notified, and GHSA IDs that exist in the repository are linked to their advisories.
 
-Runs outside the sandbox with a GitHub App token. Prints nothing.
+Runs outside the sandbox with a GitHub App token. Prints nothing unless `--dry-run` is passed.
 """
 
+import argparse
 import datetime
 import os
 import re
@@ -43,21 +44,37 @@ def sanitize(text: str, known: set[str], repo: str) -> str:
 
 
 def main() -> None:
-    token = os.environ["GH_TOKEN"]
-    repo = os.environ["REPO"]
-    in_dir = Path(sys.argv[1])
-    out_dir = Path(sys.argv[2])
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("in_dir", type=Path)
+    parser.add_argument("out_dir", type=Path)
+    parser.add_argument("--repo", default="mlflow/mlflow")
+    parser.add_argument("--project", type=int)
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print the item body instead of publishing it."
+    )
+    args = parser.parse_args()
+
+    repo: str = args.repo
+    in_dir: Path = args.in_dir
+    out_dir: Path = args.out_dir
     known = {p.stem for p in (in_dir / "advisories").glob("GHSA-*.json")}
     summary = sanitize((out_dir / "summary.md").read_text(), known, repo)
     processed = (in_dir / "processed.txt").read_text()
     body = f"{summary.rstrip()}\n\n<!-- processed\n{processed.rstrip()}\n-->\n"
+    if args.dry_run:
+        sys.stdout.write(body)
+        return
+    if args.project is None:
+        parser.error("--project is required unless --dry-run is passed")
+
+    token = os.environ["GH_TOKEN"]
 
     project_id = graphql(
         token,
         "query($org: String!, $number: Int!) "
         "{ organization(login: $org) { projectV2(number: $number) { id } } }",
-        org=os.environ["ORG"],
-        number=int(os.environ["PROJECT_NUMBER"]),
+        org=repo.split("/")[0],
+        number=args.project,
     )["organization"]["projectV2"]["id"]
     today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
     graphql(
